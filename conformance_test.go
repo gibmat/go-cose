@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
 	_ "crypto/sha256"
@@ -12,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -71,6 +73,7 @@ var testCases = []struct {
 	{name: "sign1-sign-0004", deterministic: true},
 	{name: "sign1-sign-0005", deterministic: true},
 	{name: "sign1-sign-0006", deterministic: true},
+	{name: "sign1-sign-0007", deterministic: true}, // EdDSA Ed25519
 	{name: "sign1-verify-0000"},
 	{name: "sign1-verify-0001"},
 	{name: "sign1-verify-0002"},
@@ -78,10 +81,12 @@ var testCases = []struct {
 	{name: "sign1-verify-0004"},
 	{name: "sign1-verify-0005"},
 	{name: "sign1-verify-0006"},
+	{name: "sign1-verify-0007"}, // EdDSA Ed25519
 	{name: "sign1-verify-negative-0000", err: "cbor: invalid protected header: cbor: require bstr type"},
 	{name: "sign1-verify-negative-0001", err: "cbor: invalid protected header: cbor: protected header: require map type"},
 	{name: "sign1-verify-negative-0002", err: "cbor: invalid protected header: cbor: found duplicate map key \"1\" at map element index 1"},
 	{name: "sign1-verify-negative-0003", err: "cbor: invalid unprotected header: cbor: found duplicate map key \"4\" at map element index 1"},
+	{name: "sign1-verify-negative-0004"}, // EdDSA Ed25519 invalid signature
 }
 
 func TestConformance(t *testing.T) {
@@ -164,7 +169,13 @@ func testSign1(t *testing.T, tc *TestCase, deterministic bool) {
 	if sig.External != "" {
 		external = mustHexToBytes(sig.External)
 	}
-	err = sigMsg.Sign(new(zeroSource), external, signer)
+	// Ed25519 signatures are deterministic and should use nil for rand
+	// Other algorithms use zeroSource for reproducible test results
+	var rand io.Reader = new(zeroSource)
+	if tc.Alg == "EdDSA" {
+		rand = nil
+	}
+	err = sigMsg.Sign(rand, external, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,11 +198,44 @@ func testSign1(t *testing.T, tc *TestCase, deterministic bool) {
 }
 
 func getSigner(tc *TestCase, private bool) (cose.Signer, cose.Verifier, error) {
+	alg := mustNameToAlg(tc.Alg)
+	
+	// Special handling for OKP keys
+	if tc.Key["kty"] == "OKP" {
+		switch tc.Key["crv"] {
+		case "Ed25519":
+			// Note: Ed448 would require different key size validation (57 bytes)
+			verifierKey, privateKeySigner, err := createEd25519Key(tc.Key, private)
+			if err != nil {
+				return nil, nil, err
+			}
+			
+			var signer cose.Signer
+			if private {
+				signer, err = cose.NewSigner(alg, privateKeySigner)
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+			
+			verifier, err := cose.NewVerifier(alg, verifierKey)
+			if err != nil {
+				return nil, nil, err
+			}
+			return signer, verifier, nil
+		case "Ed448":
+			// Ed448 support would go here - requires golang.org/x/crypto/ed448
+			return nil, nil, errors.New("Ed448 not yet implemented")
+		default:
+			return nil, nil, errors.New("unsupported OKP curve: " + tc.Key["crv"])
+		}
+	}
+	
+	// Original implementation for RSA and EC keys
 	pkey, err := getKey(tc.Key, private)
 	if err != nil {
 		return nil, nil, err
 	}
-	alg := mustNameToAlg(tc.Alg)
 	signer, err := cose.NewSigner(alg, pkey)
 	if err != nil {
 		return nil, nil, err
@@ -248,6 +292,26 @@ func getKey(key Key, private bool) (crypto.Signer, error) {
 			pkey.D = mustBase64ToBigInt(key["d"])
 		}
 		return pkey, nil
+	case "OKP":
+		// Only Ed25519 is supported for now
+		switch key["crv"] {
+		case "Ed25519":
+			_, privateKeySigner, err := createEd25519Key(key, private)
+			if err != nil {
+				return nil, err
+			}
+			if !private {
+				// For public key only operations, we need to return a type that satisfies crypto.Signer
+				// but this won't work for verify-only operations. We'll handle this in getSigner.
+				return nil, errors.New("OKP public-only key not supported in this context")
+			}
+			return privateKeySigner, nil
+		case "Ed448":
+			// Ed448 support would require golang.org/x/crypto/ed448
+			return nil, errors.New("Ed448 not yet implemented")
+		default:
+			return nil, errors.New("unsupported OKP curve: " + key["crv"])
+		}
 	}
 	return nil, errors.New("unsupported key type: " + key["kty"])
 }
@@ -297,6 +361,35 @@ func mustBase64ToBigInt(s string) *big.Int {
 	return new(big.Int).SetBytes(val)
 }
 
+func mustBase64ToBytes(s string) []byte {
+	val, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return val
+}
+
+// createEd25519Key creates an Ed25519 key from test case data
+func createEd25519Key(key Key, private bool) (ed25519.PublicKey, crypto.Signer, error) {
+	publicKey := mustBase64ToBytes(key["x"])
+	if len(publicKey) != ed25519.PublicKeySize {
+		return nil, nil, errors.New("invalid Ed25519 public key size")
+	}
+	
+	if !private {
+		return ed25519.PublicKey(publicKey), nil, nil
+	}
+	
+	privateKey := mustBase64ToBytes(key["d"])
+	if len(privateKey) != ed25519.SeedSize {
+		return nil, nil, errors.New("invalid Ed25519 private key size")
+	}
+	
+	fullPrivateKey := ed25519.NewKeyFromSeed(privateKey)
+	publicKeyFromPrivate := fullPrivateKey.Public().(ed25519.PublicKey)
+	return publicKeyFromPrivate, fullPrivateKey, nil
+}
+
 // mustNameToAlg returns the algorithm associated to name.
 // The content of name is not defined in any RFC,
 // but it's what the test cases use to identify algorithms.
@@ -320,6 +413,8 @@ func mustNameToAlg(name string) cose.Algorithm {
 		return cose.AlgorithmES384
 	case "ES512":
 		return cose.AlgorithmES512
+	case "EdDSA":
+		return cose.AlgorithmEdDSA
 	}
 	panic("algorithm name not found: " + name)
 }
